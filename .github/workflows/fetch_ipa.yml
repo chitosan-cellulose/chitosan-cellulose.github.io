@@ -1,0 +1,29 @@
+name: Fetch ldysapp IPA to Pages
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download IPA from origin
+        run: |
+          mkdir -p ipa
+          curl -fL --retry 3 --connect-timeout 20 -o "ipa/2.16.54.ipa" "https://wkwk.xor.moe/zzzzldysapp/ldysapp-2.16.54.ipa"
+          ls -la ipa
+          sha256sum ipa/2.16.54.ipa
+          echo "IPA_SIZE=$(stat -c%s ipa/2.16.54.ipa)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit IPA to repo (Pages serves main root)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ipa
+          git commit -m "add ldysapp 2.16.54 ipa" || echo "nothing to commit"
+          git push
