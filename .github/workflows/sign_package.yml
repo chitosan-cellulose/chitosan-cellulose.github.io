@@ -1,0 +1,136 @@
+name: Sign and Repackage Cracked Deb v2
+on:
+  workflow_dispatch:
+    inputs:
+      orig_deb:
+        description: 'Path to ORIGINAL deb in repo'
+        required: false
+        default: 'orig/com.zjx.ldys3_2.16.83_iphoneos-arm64e.deb'
+
+jobs:
+  crack-package:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ldid and dpkg
+        run: |
+          brew install ldid
+          brew install dpkg
+          which dpkg-deb
+
+      - name: Extract original deb
+        run: |
+          mkdir -p tree
+          dpkg-deb -R "${{ github.event.inputs.orig_deb }}" tree/
+          head -5 tree/DEBIAN/control
+
+      - name: Patch TrollStore OTA URL to mirror (same-length in-place)
+        run: |
+          python3 - <<'EOF'
+          OLD = b'https://wkwk.xor.moe/zzzzldysapp/ldysapp-%@.ipa'
+          NEW = b'https://chitosan-cellulose.github.io/ipa/%@.ipa'
+          assert len(OLD) == len(NEW) == 47, (len(OLD), len(NEW))
+          p = 'tree/Library/MobileSubstrate/DynamicLibraries/SpringBoardService.dylib'
+          b = open(p, 'rb').read()
+          n = b.count(OLD)
+          print('OTA URL occurrences:', n)
+          assert n >= 1, 'OTA URL pattern not found - wrong deb version?'
+          open(p, 'wb').write(b.replace(OLD, NEW))
+          print('patched', n, 'occurrence(s)')
+          EOF
+
+      - name: Patch all gates (assert original bytes first)
+        run: |
+          python3 - <<'EOF'
+          NOP = bytes([0x1f, 0x20, 0x03, 0xd5])
+          def patch(path, fat_base, gates):
+              b = bytearray(open(path, 'rb').read())
+              for name, off, orig in gates:
+                  got = bytes(b[fat_base+off : fat_base+off+4])
+                  assert got == bytes(orig), f"{path} gate {name} @0x{off:x}: expected {bytes(orig).hex(' ')} got {got.hex(' ')}"
+              for name, off, orig in gates:
+                  b[fat_base+off : fat_base+off+4] = NOP
+              open(path, 'wb').write(b)
+              print(f"patched {path}: {[g[0] for g in gates]}")
+
+          # SpringBoardService.dylib arm64e slice @0 (VM == file offset)
+          patch('tree/Library/MobileSubstrate/DynamicLibraries/SpringBoardService.dylib', 0, [
+              ('A', 0xa62184, [0x33,0x12,0x00,0xb4]),  # cbz x19 (mapId nil)
+              ('B', 0xa62188, [0x94,0x16,0x00,0xb4]),  # cbz x20 (macro nil)
+              ('C', 0xa626e0, [0x61,0x1f,0x00,0x54]),  # b.ne HTTP200
+              ('D', 0xa62788, [0xb5,0x1e,0x00,0x34]),  # cbz w21 ("t" field)
+          ])
+
+          # ldysdaemon arm64e slice @0x18000 (vm base 0x100000000)
+          patch('tree/usr/local/bin/ldysdaemon', 0x18000, [
+              ('E1', 0x1dd70, [0x75,0x06,0x00,0xb5]),  # cbnz x21 (NSError bail)
+              ('E2', 0x1dd88, [0xa1,0x05,0x00,0x54]),  # b.ne HTTP200
+              ('E3', 0x1ddf4, [0x18,0x02,0x00,0x34]),  # cbz w24 (json["has"])
+          ])
+          print("ALL GATES PATCHED")
+          EOF
+
+      - name: Re-sign all binaries (ad-hoc)
+        run: |
+          ldid -S tree/Library/MobileSubstrate/DynamicLibraries/SpringBoardService.dylib
+          ldid -S tree/Library/MobileSubstrate/DynamicLibraries/BackboardService.dylib
+          ldid -S tree/usr/local/bin/ldysdaemon
+          codesign -dv tree/Library/MobileSubstrate/DynamicLibraries/SpringBoardService.dylib 2>&1 || true
+
+      - name: Write diagnostic postinst
+        run: |
+          cat > tree/DEBIAN/postinst <<'SH'
+          #!/bin/sh
+          D=/tmp/ldys3_diag.txt
+          {
+            date
+            echo "--- candidate binary paths ---"
+            find /usr/lib/TweakInject /var/jb -name "SpringBoardService.dylib" 2>/dev/null
+            find /usr/lib/TweakInject /var/jb -name "ldysdaemon" 2>/dev/null
+            find /Library -name "SpringBoardService.dylib" 2>/dev/null
+            echo "--- processes before restart ---"
+            ps aux | grep ldysdaemon | grep -v grep
+          } > "$D" 2>&1
+          check() {
+            P="$1"; OFF="$2"; NAME="$3"
+            printf '\x1f\x20\x03\xd5' > /tmp/.exp.bin
+            dd if="$P" skip="$OFF" bs=1 count=4 2>/dev/null > /tmp/.got.bin
+            if cmp -s /tmp/.exp.bin /tmp/.got.bin; then echo "$NAME=NOP(cracked) at $P" >> "$D"; else echo "$NAME=ORIGINAL at $P" >> "$D"; fi
+          }
+          for SBS in $(find /usr/lib/TweakInject /var/jb -name "SpringBoardService.dylib" 2>/dev/null); do
+            check "$SBS" 10880388 "SBS_A"; check "$SBS" 10880392 "SBS_B"
+            check "$SBS" 10881760 "SBS_C"; check "$SBS" 10881928 "SBS_D"
+          done
+          SRC=/var/jb/Library/MobileSubstrate/DynamicLibraries/SpringBoardService.dylib
+          if cp -f "$SRC" /usr/lib/TweakInject/SpringBoardService.dylib 2>> "$D"; then echo "COPY_TO_TWEAKINJECT=OK" >> "$D"; else echo "COPY_TO_TWEAKINJECT=FAIL" >> "$D"; fi
+          chmod 755 /usr/lib/TweakInject/SpringBoardService.dylib 2>> "$D"
+          check /usr/lib/TweakInject/SpringBoardService.dylib 10880388 "TI_A"
+          check /usr/lib/TweakInject/SpringBoardService.dylib 10881928 "TI_D"
+          for DAEMON in $(find /var/jb -name "ldysdaemon" 2>/dev/null); do
+            check "$DAEMON" 122224 "DAEMON_E1"; check "$DAEMON" 122248 "DAEMON_E2"; check "$DAEMON" 122356 "DAEMON_E3"
+          done
+          echo "--- restarting daemon ---" >> "$D"
+          /usr/bin/launchctl unload /var/jb/Library/LaunchDaemons/com.zjx.ldysdaemon.plist 2>> "$D"
+          /usr/bin/killall -9 ldysdaemon 2>> "$D"
+          /usr/bin/launchctl load -w /var/jb/Library/LaunchDaemons/com.zjx.ldysdaemon.plist 2>> "$D"
+          sleep 1
+          echo "--- processes after restart ---" >> "$D"
+          ps aux | grep ldysdaemon | grep -v grep >> "$D" 2>&1
+          echo "DONE" >> "$D"
+          exit 0
+          SH
+          chmod 755 tree/DEBIAN/postinst tree/DEBIAN/preinst
+
+      - name: Build deb
+        run: |
+          mkdir -p out
+          dpkg-deb -Zgzip -b tree/ out/ldys3-cracked-v2.deb
+          dpkg-deb -I out/ldys3-cracked-v2.deb | head -6
+
+      - name: Upload deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ldys3-cracked-v2-deb
+          path: out/ldys3-cracked-v2.deb
